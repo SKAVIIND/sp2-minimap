@@ -1,0 +1,15 @@
+# build outputs
+*.dll
+*.pdb
+*.mdb
+
+# local/editor
+.vs/
+.vscode/
+*.user
+*.suo
+obj/
+bin/
+
+# logs / temp
+*.log
