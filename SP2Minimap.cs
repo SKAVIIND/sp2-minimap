@@ -18,11 +18,15 @@ namespace SP2Minimap
         public static ManualLogSource Log;
         public static ConfigFile Cfg;
         public static bool MinimapVisible = true;
+        // 外部消费者（例如座舱地图零件）需要 RT 持续更新时置 true：
+        // HUD 隐藏也继续渲染，只是不画 GUI
+        public static bool KeepMapLive = false;
         public static bool Minimized = false;
         public static bool GuiVisible = true;
         public static bool IsFullscreen = false;
         public static bool PlacementMode = false;
         public static bool NavEnabled = false;
+        public static int KeyCapture = -1;   // >=0：正在给对应功能重新绑定按键
         public static MinimapRenderer Renderer;
         public static MinimapGui Gui;
 
@@ -61,6 +65,7 @@ namespace SP2Minimap
         public static ConfigEntry<float> CfgThrottleKp, CfgThrottleKi;
         public static ConfigEntry<float> CfgApMaxBank, CfgApPitchUpMax, CfgApPitchDownMax;
         public static ConfigEntry<bool> CfgApLowManeuver;
+        public static ConfigEntry<bool> CfgApLoopHdg, CfgApLoopAlt, CfgApLoopIas;
         public static ConfigEntry<float> CfgApLowPitchUp, CfgApLowPitchDown;
         public static ConfigEntry<float> CfgApHdgToBank, CfgApAltToPitch, CfgApVsDamp, CfgApRespGain;
         public static ConfigEntry<float> CfgApRollKp, CfgApRollKd, CfgApPitchKp, CfgApPitchKd, CfgApSmooth;
@@ -72,11 +77,11 @@ namespace SP2Minimap
         {
             Instance = this; Log = Logger; Cfg = Config;
 
-            CfgKeyToggle = Cfg.Bind("Key", "ToggleMinimap", KeyCode.F6, "");
-            CfgKeyGui = Cfg.Bind("Key", "ToggleGui", KeyCode.F7, "");
-            CfgKeyFullscreen = Cfg.Bind("Key", "ToggleFullscreen", KeyCode.F5, "");
-            CfgKeyAddWaypointAtCenter = Cfg.Bind("Key", "AddWaypointAtCenter", KeyCode.F8, "");
-            CfgKeyToggleNav = Cfg.Bind("Key", "ToggleNav", KeyCode.F9, "");
+            CfgKeyToggle = Cfg.Bind("Hotkeys", "Minimap", KeyCode.Home, "Show/hide minimap");
+            CfgKeyGui = Cfg.Bind("Hotkeys", "Panel", KeyCode.Insert, "Show/hide control panel");
+            CfgKeyFullscreen = Cfg.Bind("Hotkeys", "Fullscreen", KeyCode.End, "Toggle fullscreen map");
+            CfgKeyAddWaypointAtCenter = Cfg.Bind("Hotkeys", "Waypoint", KeyCode.PageUp, "Add waypoint ahead");
+            CfgKeyToggleNav = Cfg.Bind("Hotkeys", "Autopilot", KeyCode.PageDown, "Toggle autopilot");
 
             CfgOffsetX = Cfg.Bind("Layout", "OffsetX", 20f, "");
             CfgOffsetY = Cfg.Bind("Layout", "OffsetY", 20f, "");
@@ -147,6 +152,11 @@ namespace SP2Minimap
             CfgApLowPitchDown = Cfg.Bind("AutoPilot", "LowPitchDownDeg", 8f,
                 new ConfigDescription("低机动：低头上限（度）", new AcceptableValueRange<float>(0f, 45f)));
 
+            // 三条控制环独立开关（可以只开其中一条）
+            CfgApLoopHdg = Cfg.Bind("AutoPilot", "LoopHdg", true, "航向/滚转环");
+            CfgApLoopAlt = Cfg.Bind("AutoPilot", "LoopAlt", true, "高度/俯仰环");
+            CfgApLoopIas = Cfg.Bind("AutoPilot", "LoopIas", true, "速度/油门环");
+
             // 外环增益：目标值 → 目标姿态
             CfgApHdgToBank = Cfg.Bind("AutoPilot", "HdgToBank", 3.0f,
                 new ConfigDescription("航向误差→坡度（度/度）。3.0=偏差 10° 压 30° 坡", new AcceptableValueRange<float>(0.5f, 10f)));
@@ -183,21 +193,67 @@ namespace SP2Minimap
 
         void Update()
         {
+            // ── 按键重绑定：捕获下一次按键 ──
+            UpdateUiInputBlock();
+
+            if (KeyCapture >= 0)
+            {
+                if (Input.GetKeyDown(KeyCode.Escape)) { KeyCapture = -1; return; }
+
+                foreach (KeyCode kc in Enum.GetValues(typeof(KeyCode)))
+                {
+                    if (kc == KeyCode.None) continue;
+                    if (!Input.GetKeyDown(kc)) continue;
+
+                    switch (KeyCapture)
+                    {
+                        case 0: CfgKeyToggle.Value = kc; break;
+                        case 1: CfgKeyGui.Value = kc; break;
+                        case 2: CfgKeyFullscreen.Value = kc; break;
+                        case 3: CfgKeyToggleNav.Value = kc; break;
+                        case 4: CfgKeyAddWaypointAtCenter.Value = kc; break;
+                    }
+                    KeyCapture = -1;
+                    return;
+                }
+                return;
+            }
+
+            // ── 三个显示开关完全独立 ──
+            // 0 = 小地图   1 = 控制面板   2 = 全屏地图
+            // 鼠标在面板/地图上时，不响应任何快捷键（飞行输入由 UpdateUiInputBlock 屏蔽）
+            if (MouseOverUi) return;
+
             if (Input.GetKeyDown(CfgKeyToggle.Value))
             {
                 if (Minimized) { Minimized = false; MinimapVisible = true; if (Renderer != null) Renderer.SetVisible(true); }
-                else { MinimapVisible = !MinimapVisible; if (Renderer != null) Renderer.SetVisible(MinimapVisible); }
+                else
+                {
+                    MinimapVisible = !MinimapVisible;
+                    if (!MinimapVisible) IsFullscreen = false;   // 关地图时自动退出全屏
+                    if (Renderer != null) Renderer.SetVisible(MinimapVisible);
+                }
             }
+
             if (Input.GetKeyDown(CfgKeyGui.Value)) GuiVisible = !GuiVisible;
+
             if (Input.GetKeyDown(CfgKeyFullscreen.Value))
             {
-                IsFullscreen = !IsFullscreen; PlacementMode = false;
-                if (IsFullscreen && Minimized) Minimized = false;
-                if (Renderer != null && !IsFullscreen) Renderer.MapPanOffset = Vector3.zero;
+                IsFullscreen = !IsFullscreen;
+                PlacementMode = false;
+                if (IsFullscreen)
+                {
+                    // 全屏只是地图的显示模式，需要地图处于开启状态
+                    MinimapVisible = true;
+                    Minimized = false;
+                    if (Renderer != null) Renderer.SetVisible(true);
+                }
+                else if (Renderer != null) Renderer.MapPanOffset = Vector3.zero;
             }
+
             if (Input.GetKeyDown(CfgKeyAddWaypointAtCenter.Value) && Renderer != null)
                 Renderer.AddWaypointAhead(500f);
-            // Enter（或配置的 F9）切换自动驾驶；文本框有焦点时忽略
+            // Enter（或配置的按键）切换自动驾驶；文本框有焦点时忽略
             bool apKey = Input.GetKeyDown(KeyCode.Return) || Input.GetKeyDown(CfgKeyToggleNav.Value);
             if (apKey && GUIUtility.keyboardControl == 0) ToggleAutopilot();
         }
@@ -210,10 +266,135 @@ namespace SP2Minimap
             Log.LogInfo("[AP] " + (NavEnabled ? "ON" : "OFF"));
         }
 
+        // ══════════ 三条控制环的输入接管 ══════════
+        // AP 的 AiControlledAircraftScript 默认会接管 Pitch/Roll/Yaw/Throttle。
+        // 关闭某一条环时，直接把这个轴的 override 移除（null），手动输入就能回来。
+        static readonly Func<float?> _ovPitch = () => Mathf.Clamp(Plugin.CmdPitch, -1f, 1f);
+        static readonly Func<float?> _ovRoll = () => Mathf.Clamp(Plugin.CmdRoll, -1f, 1f);
+        static readonly Func<float?> _ovThrottle = () => Mathf.Clamp01(Plugin.CmdThrottle);
+
+        // 返回 null = 不接管这一轴，让玩家手动输入生效。
+        // 注意：不能 SetInputOverride(input, null)，那会把 key 从字典里删掉，
+        // AiControlledAircraftScript 发现 override 数量变 0 会立刻重新全量接管。
+        static readonly Func<float?> _manualInput = () => null;
+
+        public static void SyncLoopOverrides()
+        {
+            try
+            {
+                var mgr = Assets.Scripts.Flight.AI.AiManagerScript.Instance;
+                var ai = mgr != null ? mgr.PlayerAiScript : null;
+                if (ai == null || ai.AiAircraftScript == null) return;
+
+                var c = ai.AiAircraftScript.Controls;
+                var gi = Assets.Scripts.Input.GameInputs.Instance;
+
+                // 关掉的轴必须把 key 删掉（传 null），AircraftControls 才会走手动输入分支。
+                // 如果保留一个返回 null 的 override，它只会“不更新”这个轴，手动输入也被挡住。
+                c.SetInputOverride(gi.Pitch, CfgApLoopAlt.Value ? _ovPitch : null);
+                c.SetInputOverride(gi.Roll, CfgApLoopHdg.Value ? _ovRoll : null);
+                c.SetInputOverride(gi.Throttle, CfgApLoopIas.Value ? _ovThrottle : null);
+
+                // 保留一个无害的占位 override，防止 HasInputOverrides 变成 false，
+                // 否则 AiControlledAircraftScript 会立刻重新全量接管
+                c.SetInputOverride(gi.DesignerPitch, _manualInput);
+
+                int mask = (CfgApLoopHdg.Value ? 1 : 0) | (CfgApLoopAlt.Value ? 2 : 0) | (CfgApLoopIas.Value ? 4 : 0);
+                if (mask != _lastLoopMask)
+                {
+                    _lastLoopMask = mask;
+                    Log.LogInfo("[AP] control loops mask=" + mask + "  (1=HDG 2=ALT 4=IAS)");
+                }
+            }
+            catch { }
+        }
+
+        // ══════════ 鼠标在 UI 上时屏蔽手动飞行输入 ══════════
+        public static bool MouseOverUi;
+
+        static bool _blkPitch, _blkRoll, _blkYaw, _blkThr;
+        static float _frozenThr;
+        static int _lastLoopMask = -1;
+        static bool _lastHover;
+        static bool _warnedNoAircraft;
+        static readonly Func<float?> _zeroInput = () => 0f;
+        static readonly Func<float?> _thrHoldInput = () => _frozenThr;
+
+        static void ResetUiBlockState()
+        {
+            _blkPitch = _blkRoll = _blkYaw = _blkThr = false;
+        }
+
+        static void UpdateUiInputBlock()
+        {
+            try
+            {
+                var ac = LocalAircraft as Assets.Scripts.Craft.AircraftScript;
+                if (ac == null)
+                {
+                    if (!_warnedNoAircraft) { _warnedNoAircraft = true; Log.LogWarning("[UI] LocalAircraft == null, mouse-over input block inactive"); }
+                    return;
+                }
+
+                var c = ac.Controls;
+                var gi = Assets.Scripts.Input.GameInputs.Instance;
+
+                bool hover = MouseOverUi;
+                if (hover != _lastHover)
+                {
+                    _lastHover = hover;
+                    Log.LogInfo("[UI] mouse over panel/map = " + hover);
+                }
+                bool nav = NavEnabled;
+
+                bool aiRoll = nav && CfgApLoopHdg.Value;
+                bool aiPitch = nav && CfgApLoopAlt.Value;
+                bool aiThr = nav && CfgApLoopIas.Value;
+
+                if (aiRoll) _blkRoll = false;
+                else SetInputBlock(c, gi.Roll, ref _blkRoll, hover, _zeroInput);
+
+                if (aiPitch) _blkPitch = false;
+                else SetInputBlock(c, gi.Pitch, ref _blkPitch, hover, _zeroInput);
+
+                SetInputBlock(c, gi.Yaw, ref _blkYaw, hover, _zeroInput);
+
+                if (aiThr) _blkThr = false;
+                else
+                {
+                    if (hover && !_blkThr)
+                    {
+                        try { _frozenThr = Mathf.Clamp01(c.Throttle); } catch { }
+                    }
+                    SetInputBlock(c, gi.Throttle, ref _blkThr, hover, _thrHoldInput);
+                }
+            }
+            catch { }
+        }
+
+        static void SetInputBlock(Assets.Scripts.Craft.AircraftControls c,
+            Assets.Scripts.Input.IGameInput input, ref bool state, bool block, Func<float?> fn)
+        {
+            if (block == state) return;
+            state = block;
+            c.SetInputOverride(input, block ? fn : null);
+        }
+
         static void AttachAutopilot()
         {
             try
             {
+                // 先记下当前油门：IAS 环关闭时用它保持
+                float throttleNow = 0.5f;
+                try
+                {
+                    var local = LocalAircraft as Assets.Scripts.Craft.AircraftScript;
+                    if (local != null) throttleNow = Mathf.Clamp01(local.Controls.Throttle);
+                }
+                catch { }
+
+                ResetUiBlockState();
+
                 var mgr = Assets.Scripts.Flight.AI.AiManagerScript.Instance;
                 if (mgr == null) { Log.LogError("[AP] AiManagerScript.Instance == null"); NavEnabled = false; return; }
 
@@ -237,6 +418,8 @@ namespace SP2Minimap
                 ai.InputOverrideEnabled = true;
                 ai.AutoDespawn = false;
 
+                if (!CfgApLoopIas.Value) CmdThrottle = throttleNow;
+
                 // 原版 AI 会把一堆无关通道也接管（起落架、刹车、武器…）。
                 // 这里只保留俯仰/横滚/偏航/油门，其余交还给玩家。
                 try
@@ -246,7 +429,7 @@ namespace SP2Minimap
                     c.SetInputOverride(gi.Yaw, null);        // 方向舵不接管
                     // 原版对「本机玩家」会主动清掉油门覆盖（573-577 行），
                     // 所以这里必须自己装回来，否则 IAS 完全不受控。
-                    c.SetInputOverride(gi.Throttle, () => Mathf.Clamp01(Plugin.CmdThrottle));
+                    // Throttle 由 SyncLoopOverrides 按 IAS 环开关决定
                     c.SetInputOverride(gi.LandingGear, null);
                     c.SetInputOverride(gi.Vtol, null);
                     c.SetInputOverride(gi.Brake, null);
@@ -261,6 +444,7 @@ namespace SP2Minimap
                 }
                 catch (Exception e2) { Log.LogWarning("[AP] 清理附加通道: " + e2.Message); }
 
+                SyncLoopOverrides();
                 NavActive = true;
                 Log.LogInfo("[AP] 已接管：自定义 ControlSystem 挂在原版 AI 上");
             }
@@ -276,6 +460,7 @@ namespace SP2Minimap
             NavActive = false;
             CmdThrottle = -1f;
             CmdPitch = CmdRoll = CmdYaw = 0f;
+            ResetUiBlockState();
             try
             {
                 var mgr = Assets.Scripts.Flight.AI.AiManagerScript.Instance;
@@ -546,7 +731,7 @@ namespace SP2Minimap
             Rescan();
         }
 
-        public void SetVisible(bool visible) { if (_camObj != null) _camObj.SetActive(visible); }
+        public void SetVisible(bool visible) { if (_camObj != null && !Plugin.KeepMapLive) _camObj.SetActive(visible); }
 
         int DesiredRTSize()
         {
@@ -557,7 +742,8 @@ namespace SP2Minimap
 
         void LateUpdate()
         {
-            if (!Plugin.MinimapVisible || Cam == null) return;
+            if (Cam == null) return;
+            if (!Plugin.MinimapVisible && !Plugin.KeepMapLive) return;
             AircraftDataReflect.Bind(GetLocalAircraft());
 
             int desired = DesiredRTSize();
@@ -628,7 +814,11 @@ namespace SP2Minimap
         // AP 控制环跑在固定步长上，与渲染帧率解耦
         void FixedUpdate()
         {
-            if (Plugin.NavEnabled) ComputeControl();
+            if (Plugin.NavEnabled)
+            {
+                Plugin.SyncLoopOverrides();
+                ComputeControl();
+            }
         }
 
         void ComputeControl()
@@ -709,12 +899,20 @@ namespace SP2Minimap
             float respGain = Mathf.Max(0.05f, Plugin.CfgApRespGain.Value);
             float hdErr = Mathf.DeltaAngle(curHd, targetHd);
             float maxBank = Mathf.Abs(Plugin.CfgApMaxBank.Value);
-            float desiredBankRight = Mathf.Clamp(hdErr * Plugin.CfgApHdgToBank.Value * respGain, -maxBank, maxBank);
+            float desiredBankRight;
+            if (Plugin.CfgApLoopHdg.Value)
+                desiredBankRight = Mathf.Clamp(hdErr * Plugin.CfgApHdgToBank.Value * respGain, -maxBank, maxBank);
+            else
+                desiredBankRight = 0f;          // HDG 关闭：保持机翼水平，不做航向转弯
 
             // ---------- 外环：高度 → 目标俯仰（抬头为正） ----------
             float altErr = targetAltM - curAltM;
-            float desiredPitch = altErr * Plugin.CfgApAltToPitch.Value * respGain
-                               - body.linearVelocity.y * Plugin.CfgApVsDamp.Value;
+            float desiredPitch;
+            if (Plugin.CfgApLoopAlt.Value)
+                desiredPitch = altErr * Plugin.CfgApAltToPitch.Value * respGain
+                             - body.linearVelocity.y * Plugin.CfgApVsDamp.Value;
+            else
+                desiredPitch = pitchAng;        // ALT 关闭：保持当前俯仰
 
             // 方向写死：低头侧永远取负，抬头侧永远取正
             float downLimit = -Mathf.Abs(Plugin.CfgApPitchDownMax.Value);
@@ -746,10 +944,14 @@ namespace SP2Minimap
 
             // ---------- 油门 ----------
             float speedErr = targetSpeedMps - curIAS;
-            _throttleIntegral += speedErr * dt;
-            _throttleIntegral = Mathf.Clamp(_throttleIntegral, -300f, 300f);
-            float ff = Mathf.Clamp01(targetSpeedMps / 150f);
-            Plugin.CmdThrottle = Mathf.Clamp01(ff + speedErr * Plugin.CfgThrottleKp.Value + _throttleIntegral * Plugin.CfgThrottleKi.Value);
+            if (Plugin.CfgApLoopIas.Value)
+            {
+                _throttleIntegral += speedErr * dt;
+                _throttleIntegral = Mathf.Clamp(_throttleIntegral, -300f, 300f);
+                float ff = Mathf.Clamp01(targetSpeedMps / 150f);
+                Plugin.CmdThrottle = Mathf.Clamp01(ff + speedErr * Plugin.CfgThrottleKp.Value + _throttleIntegral * Plugin.CfgThrottleKi.Value);
+            }
+            // IAS 关闭：不更新 CmdThrottle，保持当前油门
 
             // ---------- 调试 ----------
             DebugApStatus = (noWp ? "无航点→固定 " : "AP ")
@@ -1272,9 +1474,20 @@ namespace SP2Minimap
         {
             InitMcp();
             if (Plugin.GuiVisible) DrawPanel();
-            if (!Plugin.MinimapVisible) return;
-            if (Plugin.Minimized) { DrawMinimizedButton(); return; }
-            if (Plugin.IsFullscreen) DrawFullscreen(); else DrawMini();
+
+            if (Plugin.MinimapVisible)
+            {
+                if (Plugin.Minimized) DrawMinimizedButton();
+                else if (Plugin.IsFullscreen) DrawFullscreen();
+                else DrawMini();
+            }
+
+            // 记录鼠标是否停在面板/地图上（下一帧 Update 用它屏蔽飞行输入）
+            Vector2 mp = Event.current != null ? Event.current.mousePosition : Vector2.zero;
+            bool over = false;
+            if (Plugin.GuiVisible && _panelRect.width > 1f && _panelRect.Contains(mp)) over = true;
+            if (Plugin.MinimapVisible && !Plugin.Minimized && _rect.width > 1f && _rect.Contains(mp)) over = true;
+            Plugin.MouseOverUi = over;
         }
 
         void DrawMinimizedButton()
@@ -1482,7 +1695,7 @@ namespace SP2Minimap
 
             GUILayout.Space(4);
             Rect navR = GUILayoutUtility.GetRect(0f, 34f, GUILayout.ExpandWidth(true));
-            if (FlatButton(navR, Plugin.NavEnabled ? "AP  ENGAGED    (F9)" : "AP  STANDBY    (F9)", Plugin.NavEnabled))
+            if (FlatButton(navR, (Plugin.NavEnabled ? "AP  ENGAGED    (" : "AP  STANDBY    (") + Plugin.CfgKeyToggleNav.Value + ")", Plugin.NavEnabled))
             {
                 Plugin.ToggleAutopilot();
                 if (!Plugin.NavEnabled) { Plugin.NavActive = false; Plugin.CmdThrottle = -1f; }
@@ -1524,6 +1737,19 @@ namespace SP2Minimap
             GUILayout.EndHorizontal();
 
             DrawWaypointListContent(Plugin.Renderer);
+
+            SectionLabel("HOTKEYS");
+            DrawKeyRow("MINIMAP", Plugin.CfgKeyToggle, 0);
+            DrawKeyRow("PANEL", Plugin.CfgKeyGui, 1);
+            DrawKeyRow("FULLSCREEN", Plugin.CfgKeyFullscreen, 2);
+            DrawKeyRow("AUTOPILOT", Plugin.CfgKeyToggleNav, 3);
+            DrawKeyRow("WAYPOINT", Plugin.CfgKeyAddWaypointAtCenter, 4);
+            if (Plugin.KeyCapture >= 0)
+            {
+                GUIStyle hint = new GUIStyle(_mcpStatus);
+                hint.normal.textColor = ColAmber;
+                GUILayout.Label("PRESS A KEY...  (ESC = cancel)", hint);
+            }
 
             GUILayout.EndScrollView();
             GUILayout.EndArea();
@@ -2346,6 +2572,17 @@ namespace SP2Minimap
             GUI.Label(new Rect(h.x + 10f, h.y, h.width - 10f, h.height), text, _mcpTitle);
         }
 
+        // 一行快捷键：点按钮 → 再按任意键完成绑定
+        void DrawKeyRow(string label, ConfigEntry<KeyCode> cfg, int action)
+        {
+            GUILayout.BeginHorizontal();
+            GUILayout.Label(label, _mcpStatus, GUILayout.Width(110f));
+            string txt = Plugin.KeyCapture == action ? "< press >" : cfg.Value.ToString();
+            if (BtnW(txt, 170f, Plugin.KeyCapture == action))
+                Plugin.KeyCapture = action;
+            GUILayout.EndHorizontal();
+        }
+
         // 一个完整通道：标签 + 数码窗（可直接输入）+ −/+
         void McpChannel(string id, string label, string unit, ref string buf, ref bool editing,
                         float shown, float min, float max, float step, string fmt,
@@ -2456,6 +2693,17 @@ namespace SP2Minimap
             GUI.Label(new Rect(hdr.xMax - 78f, hdr.y, 72f, hdr.height),
                       Plugin.NavEnabled ? "ENGAGED" : "STANDBY", st);
 
+            GUILayout.Space(4);
+
+            GUILayout.Label("CONTROL LOOPS  (可只开其中一个)", _mcpLabel);
+            GUILayout.BeginHorizontal();
+            if (Btn("HDG " + (Plugin.CfgApLoopHdg.Value ? "ON" : "OFF"), Plugin.CfgApLoopHdg.Value))
+                Plugin.CfgApLoopHdg.Value = !Plugin.CfgApLoopHdg.Value;
+            if (Btn("ALT " + (Plugin.CfgApLoopAlt.Value ? "ON" : "OFF"), Plugin.CfgApLoopAlt.Value))
+                Plugin.CfgApLoopAlt.Value = !Plugin.CfgApLoopAlt.Value;
+            if (Btn("IAS " + (Plugin.CfgApLoopIas.Value ? "ON" : "OFF"), Plugin.CfgApLoopIas.Value))
+                Plugin.CfgApLoopIas.Value = !Plugin.CfgApLoopIas.Value;
+            GUILayout.EndHorizontal();
             GUILayout.Space(4);
 
             McpChannel("mcp_hd", "HDG", "deg",
