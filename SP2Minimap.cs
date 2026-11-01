@@ -194,6 +194,7 @@ namespace SP2Minimap
         void Update()
         {
             // ── 按键重绑定：捕获下一次按键 ──
+            UpdateMouseOverUi();
             UpdateUiInputBlock();
 
             if (KeyCapture >= 0)
@@ -222,7 +223,7 @@ namespace SP2Minimap
             // ── 三个显示开关完全独立 ──
             // 0 = 小地图   1 = 控制面板   2 = 全屏地图
             // 鼠标在面板/地图上时，不响应任何快捷键（飞行输入由 UpdateUiInputBlock 屏蔽）
-            if (MouseOverUi) return;
+            if (IsTextInputFocused() || GUIUtility.keyboardControl != 0) return;
 
             if (Input.GetKeyDown(CfgKeyToggle.Value))
             {
@@ -253,9 +254,9 @@ namespace SP2Minimap
 
             if (Input.GetKeyDown(CfgKeyAddWaypointAtCenter.Value) && Renderer != null)
                 Renderer.AddWaypointAhead(500f);
-            // Enter（或配置的按键）切换自动驾驶；文本框有焦点时忽略
-            bool apKey = Input.GetKeyDown(KeyCode.Return) || Input.GetKeyDown(CfgKeyToggleNav.Value);
-            if (apKey && GUIUtility.keyboardControl == 0) ToggleAutopilot();
+            // Enter 交回原版（游戏自己的 ToggleAutopilot）；这里只用配置的自动驾驶键
+            if (Input.GetKeyDown(CfgKeyToggleNav.Value) && GUIUtility.keyboardControl == 0)
+                ToggleAutopilot();
         }
 
         public static void ToggleAutopilot()
@@ -311,22 +312,48 @@ namespace SP2Minimap
 
         // ══════════ 鼠标在 UI 上时屏蔽手动飞行输入 ══════════
         public static bool MouseOverUi;
+        public static Rect PanelRect, MapRect;
+        public static bool PanelRectValid, MapRectValid;
 
-        static bool _blkPitch, _blkRoll, _blkYaw, _blkThr;
-        static float _frozenThr;
+        static bool _blkPitch, _blkRoll, _blkYaw;
+        static bool _blkButtons;
+        static bool _zoomCaptured, _zoomWasPrevented;
+        static Assets.Scripts.Input.IGameInput[] _hoverInputs;
+        static bool[] _hoverInputPrev;
         static int _lastLoopMask = -1;
         static bool _lastHover;
         static bool _warnedNoAircraft;
         static readonly Func<float?> _zeroInput = () => 0f;
-        static readonly Func<float?> _thrHoldInput = () => _frozenThr;
 
         static void ResetUiBlockState()
         {
-            _blkPitch = _blkRoll = _blkYaw = _blkThr = false;
+            _blkPitch = _blkRoll = _blkYaw = false;
+        }
+
+        static void UpdateMouseOverUi()
+        {
+            try
+            {
+                // 鼠标被锁定（鼠标视角/鼠标摇杆）时不存在“停在 UI 上”，不要屏蔽输入
+                if (Cursor.lockState != CursorLockMode.None) { MouseOverUi = false; return; }
+
+                Vector3 m = Input.mousePosition;
+                Vector2 mp = new Vector2(m.x, Screen.height - m.y);
+                MouseOverUi =
+                    (GuiVisible && PanelRectValid && PanelRect.Contains(mp)) ||
+                    (MinimapVisible && !Minimized && MapRectValid && MapRect.Contains(mp));
+            }
+            catch { MouseOverUi = false; }
         }
 
         static void UpdateUiInputBlock()
         {
+            bool hover = MouseOverUi;
+            SetHoverZoom(hover);
+
+            try { SetHoverButtons(Assets.Scripts.Input.GameInputs.Instance, hover); }
+            catch { }
+
             try
             {
                 var ac = LocalAircraft as Assets.Scripts.Craft.AircraftScript;
@@ -339,7 +366,6 @@ namespace SP2Minimap
                 var c = ac.Controls;
                 var gi = Assets.Scripts.Input.GameInputs.Instance;
 
-                bool hover = MouseOverUi;
                 if (hover != _lastHover)
                 {
                     _lastHover = hover;
@@ -349,7 +375,6 @@ namespace SP2Minimap
 
                 bool aiRoll = nav && CfgApLoopHdg.Value;
                 bool aiPitch = nav && CfgApLoopAlt.Value;
-                bool aiThr = nav && CfgApLoopIas.Value;
 
                 if (aiRoll) _blkRoll = false;
                 else SetInputBlock(c, gi.Roll, ref _blkRoll, hover, _zeroInput);
@@ -359,17 +384,70 @@ namespace SP2Minimap
 
                 SetInputBlock(c, gi.Yaw, ref _blkYaw, hover, _zeroInput);
 
-                if (aiThr) _blkThr = false;
-                else
+                // 不冻结油门：鼠标在 UI/场景间切换时冻结再恢复会造成油门跳变
+            }
+            catch { }
+        }
+
+        static void SetHoverButtons(Assets.Scripts.Input.GameInputs gi, bool block)
+        {
+            if (block == _blkButtons) return;
+
+            if (_hoverInputs == null)
+            {
+                _hoverInputs = new Assets.Scripts.Input.IGameInput[]
                 {
-                    if (hover && !_blkThr)
-                    {
-                        try { _frozenThr = Mathf.Clamp01(c.Throttle); } catch { }
-                    }
-                    SetInputBlock(c, gi.Throttle, ref _blkThr, hover, _thrHoldInput);
+                    gi.Activate1, gi.Activate2, gi.Activate3, gi.Activate4,
+                    gi.Activate5, gi.Activate6, gi.Activate7, gi.Activate8,
+                    gi.ToggleActivationPanel,
+                    gi.FireGuns, gi.FireWeapons, gi.LaunchCountermeasures
+                };
+                _hoverInputPrev = new bool[_hoverInputs.Length];
+            }
+
+            // 数字键是在 UpdateActivationButtonState 里直接读 input.GetButtonDownIfEnabled()，
+            // 不经过 AircraftControls 的 override，所以必须直接禁用 input.Enabled
+            if (block)
+            {
+                for (int i = 0; i < _hoverInputs.Length; i++)
+                {
+                    _hoverInputPrev[i] = _hoverInputs[i].Enabled;
+                    _hoverInputs[i].Enabled = false;
+                }
+            }
+            else
+            {
+                for (int i = 0; i < _hoverInputs.Length; i++)
+                    _hoverInputs[i].Enabled = _hoverInputPrev[i];
+            }
+
+            _blkButtons = block;
+        }
+
+        static void SetHoverZoom(bool block)
+        {
+            try
+            {
+                if (block && !_zoomCaptured)
+                {
+                    _zoomCaptured = true;
+                    _zoomWasPrevented = Assets.Scripts.Flight.Cameras.CameraManagerScript.PreventZoom;
+                    Assets.Scripts.Flight.Cameras.CameraManagerScript.PreventZoom = true;
+                }
+                else if (!block && _zoomCaptured)
+                {
+                    _zoomCaptured = false;
+                    Assets.Scripts.Flight.Cameras.CameraManagerScript.PreventZoom = _zoomWasPrevented;
                 }
             }
             catch { }
+        }
+
+        // 聊天/输入框是否正在输入（直接用游戏自己的判断）
+        static bool IsTextInputFocused()
+        {
+            try { return Assets.Scripts.Game.Instance.UserInterface.IsTextInputFocused; }
+            catch { return false; }
         }
 
         static void SetInputBlock(Assets.Scripts.Craft.AircraftControls c,
@@ -677,6 +755,8 @@ namespace SP2Minimap
         int _lastSize = -1;
         float _rescanTimer = 0f;
         Vector3 _lastFloatingOffset;
+        bool _apWasActive;
+        bool _iasWasOn = true;
         float _throttleIntegral = 0f;
         bool _hasPrev;
         float _prevPitch, _prevBank;
@@ -816,9 +896,40 @@ namespace SP2Minimap
         {
             if (Plugin.NavEnabled)
             {
+                if (!_apWasActive)
+                {
+                    // 刚接管：清掉上一轮的积分/平滑，油门从当前值起步，避免刚开 AP 就猛推/猛收
+                    _apWasActive = true;
+                    _hasPrev = false;
+                    _throttleIntegral = 0f;
+                    _rollOut = _pitchOut = 0f;
+                    Plugin.CmdThrottle = CurrentThrottle();
+                }
+
+                bool iasOn = Plugin.CfgApLoopIas.Value;
+                if (iasOn && !_iasWasOn)
+                {
+                    // IAS 从关到开：积分清零，油门从当前手动值接上
+                    _throttleIntegral = 0f;
+                    Plugin.CmdThrottle = CurrentThrottle();
+                }
+                _iasWasOn = iasOn;
+
                 Plugin.SyncLoopOverrides();
                 ComputeControl();
             }
+            else _apWasActive = false;
+        }
+
+        static float CurrentThrottle()
+        {
+            try
+            {
+                var ac = Plugin.LocalAircraft as Assets.Scripts.Craft.AircraftScript;
+                if (ac != null) return Mathf.Clamp01(ac.Controls.Throttle);
+            }
+            catch { }
+            return 0.5f;
         }
 
         void ComputeControl()
@@ -1473,6 +1584,9 @@ namespace SP2Minimap
         void OnGUI()
         {
             InitMcp();
+            Plugin.PanelRectValid = false;
+            Plugin.MapRectValid = false;
+
             if (Plugin.GuiVisible) DrawPanel();
 
             if (Plugin.MinimapVisible)
@@ -1481,13 +1595,6 @@ namespace SP2Minimap
                 else if (Plugin.IsFullscreen) DrawFullscreen();
                 else DrawMini();
             }
-
-            // 记录鼠标是否停在面板/地图上（下一帧 Update 用它屏蔽飞行输入）
-            Vector2 mp = Event.current != null ? Event.current.mousePosition : Vector2.zero;
-            bool over = false;
-            if (Plugin.GuiVisible && _panelRect.width > 1f && _panelRect.Contains(mp)) over = true;
-            if (Plugin.MinimapVisible && !Plugin.Minimized && _rect.width > 1f && _rect.Contains(mp)) over = true;
-            Plugin.MouseOverUi = over;
         }
 
         void DrawMinimizedButton()
@@ -1515,6 +1622,8 @@ namespace SP2Minimap
             if (r == null) return;
             float size = Plugin.CfgSizePx.Value;
             _rect = new Rect(Plugin.CfgOffsetX.Value, Plugin.CfgOffsetY.Value, size, size);
+            Plugin.MapRect = _rect;
+            Plugin.MapRectValid = true;
             HandleMiniInput();
             var old = GUI.color;
             GUI.color = new Color(0f, 0f, 0f, 0.7f);
@@ -1548,6 +1657,8 @@ namespace SP2Minimap
             float size = Mathf.Min(Screen.width, Screen.height) - 2f * margin;
             float left = Mathf.Max(margin, (Screen.width - size - 380f) * 0.5f);
             _rect = new Rect(left, (Screen.height - size) * 0.5f, size, size);
+            Plugin.MapRect = _rect;
+            Plugin.MapRectValid = true;
             HandleFullscreenInput();
             if (r.Tex != null) GUI.DrawTexture(_rect, r.Tex, ScaleMode.StretchToFill, false);
             DrawBorder(_rect, Plugin.PlacementMode ? new Color(1f, 0.8f, 0.2f, 1f) : new Color(0.3f, 0.7f, 1f, 0.9f), 2f);
@@ -1674,6 +1785,8 @@ namespace SP2Minimap
             float x = Plugin.CfgPanelX.Value < 0 ? Screen.width - w - 20 : Plugin.CfgPanelX.Value;
             float y = Plugin.CfgPanelY.Value < 0 ? 20 : Plugin.CfgPanelY.Value;
             _panelRect = new Rect(x, y, w, h);
+            Plugin.PanelRect = _panelRect;
+            Plugin.PanelRectValid = true;
             InitMcp();
 
             FillRect(_panelRect, new Color(0.10f, 0.11f, 0.125f, 0.97f));
@@ -2011,7 +2124,7 @@ namespace SP2Minimap
                 Plugin.BlockMouseInputUntil = Time.unscaledTime + 0.2f;
                 current.Use();
             }
-            else if (Plugin.PlacementMode)
+            else if (current.shift || Plugin.PlacementMode)
             {
                 AddWaypointFromScreen(mousePosition);
                 current.Use();
